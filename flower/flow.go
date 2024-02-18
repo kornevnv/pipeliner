@@ -34,7 +34,7 @@ type flow[T any] struct {
 	// перечень потоков, которым необходимо передать результат выполнения
 	outFlows []string
 
-	queue queue[T]
+	queue Queue[T]
 
 	// функции обработки данных
 	procFs []processFunc[T]
@@ -68,7 +68,7 @@ type flowOut[T any] struct {
 }
 
 // newFlow инициализирует экземпляр потока данных
-func newFlow[T any](flowerID string, name string, q queue[T], outF []string, wCount int, pFunc ...processFunc[T]) (*flow[T], error) {
+func newFlow[T any](flowerID string, name string, q Queue[T], outF []string, wCount int, pFunc ...processFunc[T]) (*flow[T], error) {
 	if len(pFunc) == 0 {
 		return nil, errFlowProcFuncIsNotSet
 	}

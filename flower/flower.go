@@ -4,38 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
-
-	mq "flower/queue/mem"
-	rq "flower/queue/redis"
 )
 
 const checkInterval = 3 * time.Second
-
-const (
-	redisQueue    = "redis"
-	redisQAddress = "redisAddress"
-	redisQPwd     = "redisPwd"
-	redisQDB      = "redisDB"
-)
-
-const (
-	memQueue = "memory" // default engine
-	memQCap  = "memCap"
-)
-
-const defaultQueueEngine = memQueue
-
-// allowedQueueEngine доступные типы очередей
-var allowedQueueEngine = map[string]struct{}{
-	memQueue:   {},
-	redisQueue: {},
-}
 
 var (
 	ErrFlowNotFound           = errors.New("flow not found")
@@ -44,8 +20,8 @@ var (
 	ErrUnsupportedQueueEngine = errors.New("unsupported queue engine")
 )
 
-// queue определяет интерфейс очереди
-type queue[T any] interface {
+// Queue определяет интерфейс очереди
+type Queue[T any] interface {
 	Push(val T) error
 	Next() (T, bool, error)
 	Len() int
@@ -58,9 +34,12 @@ type registry[T any] map[string]*flow[T]
 
 type queueEngineParams map[string]string
 
+type CreateQueueFunc[T any] func(name string) (Queue[T], error)
+
 type Flower[T any] struct {
 	id string
 
+	// хранилище потоков
 	reg registry[T]
 
 	waitInput atomic.Bool
@@ -69,8 +48,8 @@ type Flower[T any] struct {
 
 	pendingCnt atomic.Int64
 
-	queueEngine       string
-	queueEngineParams queueEngineParams
+	// функция создания очередей
+	cqf CreateQueueFunc[T]
 
 	// сигнальные каналы завершения
 	doneCh    chan struct{}
@@ -80,17 +59,25 @@ type Flower[T any] struct {
 }
 
 // NewFlower создает новый экземпляр
-func NewFlower[T any](id string, waitInput bool) (*Flower[T], error) {
+// waitInput определяет поведение оркестратора, для завершения обработки ожидает false.
+// т.е. даже если все элементы обработаны - watcher не закроет очереди и процесс, т.к. будет ожидать еще данных.
+// cfq - функция создания очереди для потоков (AddFlow)
+func NewFlower[T any](id string, waitInput bool, cfq CreateQueueFunc[T]) (*Flower[T], error) {
 	if id == "" {
 		return nil, ErrFlowerIdRequired
 	}
 
+	if cfq == nil {
+		return nil, ErrUnsupportedQueueEngine
+	}
+
 	f := &Flower[T]{
-		id:          id,
-		reg:         make(registry[T]),
-		queueEngine: defaultQueueEngine,
-		doneCh:      make(chan struct{}),
-		suspendCh:   make(chan struct{}),
+		id:  id,
+		reg: make(registry[T]),
+		//	queueEngine: defaultQueueEngine,
+		cqf:       cfq,
+		doneCh:    make(chan struct{}),
+		suspendCh: make(chan struct{}),
 	}
 
 	f.waitInput.Store(waitInput)
@@ -104,11 +91,6 @@ func NewFlower[T any](id string, waitInput bool) (*Flower[T], error) {
 // процесс обработки результатов работы потоков (watchResults)
 func (f *Flower[T]) Run(ctx context.Context) error {
 	defer f.closed.Store(true)
-
-	if _, ok := allowedQueueEngine[f.queueEngine]; !ok {
-		return ErrUnsupportedQueueEngine
-	}
-
 	var wg sync.WaitGroup
 
 	flowsCtx, cancel := context.WithCancel(ctx)
@@ -170,55 +152,17 @@ func (f *Flower[T]) CleanUP() error {
 	return nil
 }
 
-// UseMemoryQueue задет использование in-memory (slice) в качестве FIFO очереди
-func (f *Flower[T]) UseMemoryQueue(cap int) {
-	f.queueEngine = memQueue
-	f.queueEngineParams = queueEngineParams{
-		memQCap: fmt.Sprintf("%d", cap),
-	}
-}
-
-// UseRedisQueue задет использование redis (list) в качестве FIFO очереди
-func (f *Flower[T]) UseRedisQueue(addr, password string, db int) {
-	f.queueEngine = redisQueue
-	f.queueEngineParams = queueEngineParams{
-		redisQAddress: addr,
-		redisQPwd:     password,
-		redisQDB:      fmt.Sprintf("%d", db),
-	}
-}
-
 // AddFlow регистрирует поток в координаторе
 // В зависимости от выбранном в координаторе queueEngine создает соответсвующую очередь
 func (f *Flower[T]) AddFlow(name string, wc int, out []string, pf ...processFunc[T]) error {
-	if _, ok := allowedQueueEngine[f.queueEngine]; !ok {
-		return ErrUnsupportedQueueEngine
-	}
-
 	if f.closed.Load() {
 		return ErrFlowerClosed
 	}
 
-	q := queue[T](nil)
-	var err error
-	switch f.queueEngine {
-	// поведение по умолчанию
-	case memQueue, "":
-		// обработка ошибки не нужна, т.к. будет использован дефотный размер
-		cap, _ := strconv.Atoi(f.queueEngineParams[memQCap])
-		q = mq.New[T](cap, f.id+"-"+name)
-	case redisQueue:
-		addr := f.queueEngineParams[redisQAddress]
-		pwd := f.queueEngineParams[redisQPwd]
-		db, err := strconv.Atoi(f.queueEngineParams[redisQDB])
-		if err != nil {
-			return fmt.Errorf("bad radis db")
-		}
-
-		q, err = rq.New[T](addr, pwd, db, f.id+"-"+name)
-		if err != nil {
-			return fmt.Errorf("init redis queue error: %s", err)
-		}
+	queueName := f.id + "-" + name
+	q, err := f.cqf(queueName)
+	if err != nil {
+		return fmt.Errorf("create queue error: %s", err)
 	}
 
 	fl, err := newFlow(f.id, name, q, out, wc, pf...)

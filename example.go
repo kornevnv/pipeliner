@@ -10,6 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	fl "flower/flower"
+	rq "flower/queue/redis"
 )
 
 type Host struct {
@@ -47,14 +48,27 @@ type TaskController struct {
 	CleanUPFunc func() error
 }
 
+// useRedisQueue враппер для инициализации очереди
+func useRedisQueue[T any](addr, pwd string, db int) fl.CreateQueueFunc[T] {
+	return func(name string) (fl.Queue[T], error) {
+		q, err := rq.New[T](addr, pwd, db, name)
+		if err != nil {
+			return nil, err
+		}
+		return q, nil
+	}
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-	flwr, err := fl.NewFlower[Host]("cpt-active-1", false)
+
+	// возвращаем функцию инициализации очереди
+	redisQueueCF := useRedisQueue[Host]("localhost:6379", "password", 0)
+
+	flwr, err := fl.NewFlower[Host]("cpt-active-1", false, redisQueueCF)
 	if err != nil {
 		log.WithError(err).Errorf("")
 	}
-
-	flwr.UseRedisQueue("localhost:6379", "password", 0)
 
 	rts := TaskController{
 		CancelFunc:  cancel,
