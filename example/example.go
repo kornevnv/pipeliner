@@ -1,4 +1,6 @@
-package main
+// nolint
+
+package example
 
 import (
 	"context"
@@ -9,8 +11,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	fl "flower/flower"
-	rq "flower/queue/redis"
+	pl "pipeliner"
+
+	rq "pipeliner/queue/redisQueue"
 )
 
 type Host struct {
@@ -49,8 +52,8 @@ type TaskController struct {
 }
 
 // useRedisQueue враппер для инициализации очереди
-func useRedisQueue[T any](addr, pwd string, db int) fl.CreateQueueFunc[T] {
-	return func(name string) (fl.Queue[T], error) {
+func useRedisQueue[T any](addr, pwd string, db int) pl.CreateQueueFunc[T] {
+	return func(name string) (pl.Queue[T], error) {
 		q, err := rq.New[T](addr, pwd, db, name)
 		if err != nil {
 			return nil, err
@@ -65,39 +68,39 @@ func main() {
 	// возвращаем функцию инициализации очереди
 	redisQueueCF := useRedisQueue[Host]("localhost:6379", "password", 0)
 
-	flwr, err := fl.NewFlower[Host]("cpt-active-1", false, redisQueueCF)
+	proc, err := pl.NewPipeliner[Host]("cpt-active-1", false, redisQueueCF)
 	if err != nil {
 		log.WithError(err).Errorf("")
 	}
 
 	rts := TaskController{
 		CancelFunc:  cancel,
-		SuspendFunc: flwr.Suspend,
-		CleanUPFunc: flwr.CleanUP,
+		SuspendFunc: proc.Suspend,
+		CleanUPFunc: proc.CleanUP,
 	}
 	_ = rts
 
-	err = flwr.AddFlow("1", 2, []string{"2", "save"}, pf1)
+	err = proc.AddPipe("1", 2, []string{"2", "save"}, pf1)
 	if err != nil {
 		log.WithError(err).Errorf("")
 	}
 
-	err = flwr.AddFlow("2", 2, []string{"3"}, pf2)
+	err = proc.AddPipe("2", 2, []string{"3"}, pf2)
 	if err != nil {
 		log.WithError(err).Errorf("")
 	}
 
-	err = flwr.AddFlow("3", 2, []string{"save"}, pf3)
+	err = proc.AddPipe("3", 2, []string{"save"}, pf3)
 	if err != nil {
 		log.WithError(err).Errorf("")
 	}
 
-	err = flwr.AddFlow("save", 1, nil, saveResults)
+	err = proc.AddPipe("save", 1, nil, saveResults)
 	if err != nil {
 		log.WithError(err).Errorf("")
 	}
 
-	err = flwr.Push("1", Host{
+	err = proc.Push("1", Host{
 		IP:      "127.0.0.1",
 		Domains: nil,
 	})
@@ -108,7 +111,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err = flwr.Run(ctx)
+		err = proc.Run(ctx)
 		if err != nil {
 			log.WithError(err).Errorf("")
 		}
@@ -146,9 +149,7 @@ func saveResults(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
 }
 
 func pf1(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
-	rand.Seed(time.Now().UnixNano())
-	n := rand.Intn(1) // n will be between 0 and 10
-	fmt.Printf("Sleeping %d seconds...\n", n)
+	n := rand.Intn(2) // n will be between 0 and 10
 	time.Sleep(time.Duration(n) * time.Second)
 	fmt.Println("PF - 1")
 
@@ -162,9 +163,6 @@ func pf1(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
 }
 
 func pf2(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
-	// rand.Seed(time.Now().UnixNano())
-	// n := rand.Intn(2) // n will be between 0 and 10
-	// fmt.Printf("Sleeping %d seconds...\n", n)
 	// time.Sleep(time.Duration(n) * time.Second)
 	fmt.Println("PF - 2")
 
@@ -177,7 +175,6 @@ func pf2(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
 }
 
 func pf3(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
-	rand.Seed(time.Now().UnixNano())
 	n := rand.Intn(2) // n will be between 0 and 10
 	fmt.Printf("Sleeping %d seconds...\n", n)
 	//	time.Sleep(time.Duration(n) * time.Second)

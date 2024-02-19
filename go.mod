@@ -1,10 +1,9 @@
-module flower
+module pipeliner
 
 go 1.21
 
 require (
 	github.com/go-redis/redis/v7 v7.4.1
-	github.com/rabbitmq/amqp091-go v1.9.0
 	github.com/sirupsen/logrus v1.9.3
 )
 

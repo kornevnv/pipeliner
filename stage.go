@@ -1,4 +1,4 @@
-package flower
+package pipeliner
 
 import (
 	"context"
@@ -11,9 +11,9 @@ import (
 )
 
 var (
-	errFlowNameIsNotSet       = errors.New("flow name is not set")
-	errFlowProcFuncIsNotSet   = errors.New("flow processing functions is not set")
-	errFlowAlreadyInitialized = errors.New("flow queue is already initialized")
+	errPipeNameIsNotSet       = errors.New("pipe name is not set")
+	errPipeProcFuncIsNotSet   = errors.New("pipe processing functions is not set")
+	errPipeAlreadyInitialized = errors.New("pipe queue is already initialized")
 
 	defaultWorkerCount = 1
 )
@@ -25,14 +25,14 @@ type processFunc[T any] func(ctx context.Context, input ...T) (results []T, comp
 // errFunc функция обработки ошибок
 type errFunc func(context.Context, error)
 
-// flow структура потока данных. содержит пул воркеров и функции обработки данных
-type flow[T any] struct {
+// pipe структура потока данных. содержит пул воркеров и функции обработки данных
+type pipe[T any] struct {
 	id string
 	// имя потока
 	name string
 
 	// перечень потоков, которым необходимо передать результат выполнения
-	outFlows []string
+	outPipes []string
 
 	queue Queue[T]
 
@@ -58,159 +58,160 @@ type flow[T any] struct {
 	initialized atomic.Bool
 
 	inCh  chan T
-	outCh chan flowOut[T]
+	outCh chan pipeOut[T]
 }
 
-// flowOut результат выполнения
-type flowOut[T any] struct {
+// pipeOut результат выполнения
+type pipeOut[T any] struct {
 	target string
 	data   T
 }
 
-// newFlow инициализирует экземпляр потока данных
-func newFlow[T any](flowerID string, name string, q Queue[T], outF []string, wCount int, pFunc ...processFunc[T]) (*flow[T], error) {
+// newPipe инициализирует экземпляр потока данных
+func newPipe[T any](pipelinerName, pipeName string, q Queue[T], outF []string, wCount int, pFunc ...processFunc[T]) (*pipe[T], error) {
 	if len(pFunc) == 0 {
-		return nil, errFlowProcFuncIsNotSet
+		return nil, errPipeProcFuncIsNotSet
 	}
-	if name == "" {
-		return nil, errFlowNameIsNotSet
+	if pipeName == "" {
+		return nil, errPipeNameIsNotSet
 	}
 
 	if wCount == 0 {
 		wCount = defaultWorkerCount
 	}
 
-	id := fmt.Sprintf("%s-%s", flowerID, name)
+	id := fmt.Sprintf("%s-%s", pipelinerName, pipeName)
 
-	return &flow[T]{
+	return &pipe[T]{
 		id:          id,
-		name:        name,
-		outFlows:    outF,
+		name:        pipeName,
+		outPipes:    outF,
 		procFs:      pFunc,
 		workerCount: wCount,
 		changedSig:  make(chan struct{}, 1),
 		inCh:        make(chan T, 1),
-		outCh:       make(chan flowOut[T]),
+		outCh:       make(chan pipeOut[T]),
 		queue:       q,
 	}, nil
 }
 
 // incPending увеличивает счетчик на 1
-func (f *flow[T]) incPending() {
-	f.pendingCount.Add(1)
+func (p *pipe[T]) incPending() {
+	p.pendingCount.Add(1)
 }
 
-func (f *flow[T]) push(ctx context.Context, val T) error {
-	return f.queue.Push(val)
+func (p *pipe[T]) push(ctx context.Context, val T) error {
+	return p.queue.Push(val)
 }
 
 // decPending уменьшает счетчик на 1
-func (f *flow[T]) decPending() {
-	f.pendingCount.Add(-1)
+func (p *pipe[T]) decPending() {
+	p.pendingCount.Add(-1)
 }
 
 // run инициализирует пул воркеров и запускает на них обработку потока данных
-func (f *flow[T]) run(ctx context.Context, doneCh, suspendCh chan struct{}) error {
-	defer close(f.outCh)
+func (p *pipe[T]) run(ctx context.Context, doneCh, suspendCh chan struct{}) error {
+	defer close(p.outCh)
 	// проверка и установка флага инициализации
-	if f.initialized.Load() {
-		return errFlowAlreadyInitialized
+	if p.initialized.Load() {
+		return errPipeAlreadyInitialized
 	}
-	f.initialized.Store(true)
+	p.initialized.Store(true)
 
 	var wg sync.WaitGroup
 
 	// инициализируем пул воркеров
-	for i := 0; i < f.workerCount; i++ {
+	for i := 0; i < p.workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			f.do(ctx)
+			p.do(ctx)
 		}()
 	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		f.readQueue(ctx, doneCh, suspendCh)
+		p.readQueue(ctx, doneCh, suspendCh)
 	}()
 
 	wg.Wait()
 
-	log.Debugf("flow run is done")
+	log.Debugf("pipe run is done")
 
 	return nil
 }
 
 // readQueue читает очередь и отправляет данные в канал
-func (f *flow[T]) readQueue(ctx context.Context, doneCh, suspendCh chan struct{}) {
-	defer close(f.inCh)
+func (p *pipe[T]) readQueue(ctx context.Context, doneCh, suspendCh chan struct{}) {
+	defer close(p.inCh)
 watchLoop:
 	for {
 		select {
 		case <-ctx.Done():
-			log.Debugf("stage %s is canceled", f.id)
+			log.Debugf("stage %s is canceled", p.id)
 			break watchLoop
 		case <-doneCh:
-			log.Debugf("stage %s context is done", f.id)
+			log.Debugf("stage %s context is done", p.id)
 			break watchLoop
 		case <-suspendCh:
-			log.Debugf("stage %s context is done by suspend", f.id)
+			log.Debugf("stage %s context is done by suspend", p.id)
 			break watchLoop
-		case <-f.queue.Signal():
-			next, ok, err := f.queue.Next()
+		case <-p.queue.Signal():
+			next, ok, err := p.queue.Next()
 			if !ok {
 				break watchLoop
 			}
 			if err != nil {
-				log.Errorf("stage %s get next val error: %s", f.id, err)
+				log.Errorf("stage %s get next val error: %s", p.id, err)
 				continue
 			}
-			f.inCh <- next
+			p.inCh <- next
 		}
 	}
 	log.Debugf("readQueue is done")
 }
 
-// do запускает цикл потока. Получает данные из входного канала, выполняет процессинг и отправляет данные в следующие потоки
-func (f *flow[T]) do(ctx context.Context) {
-	for val := range f.inCh {
+// do запускает цикл потока.
+// Получает данные из входного канала, выполняет процессинг и отправляет данные в следующие потоки
+func (p *pipe[T]) do(ctx context.Context) {
+	for val := range p.inCh {
 		// увеличиваем счетчик ожидания и последовательно выполняем процессинговые функции
 		// отправляем ошибки в функцию обработки, если она определена
-		f.incPending()
-		for i, pf := range f.procFs {
+		p.incPending()
+		for i, pf := range p.procFs {
 			results, compensate, err := pf(ctx, val)
 			if err != nil {
-				if f.errF != nil {
-					f.errF(ctx, err)
+				if p.errF != nil {
+					p.errF(ctx, err)
 				}
-				log.Debugf("flow %s was detected error at %d processing function result", f.name, i)
+				log.Debugf("pipe %s was detected error at %d processing function result", p.name, i)
 			}
 			for _, cmp := range compensate {
-				f.outCh <- flowOut[T]{
-					target: f.name,
+				p.outCh <- pipeOut[T]{
+					target: p.name,
 					data:   cmp,
 				}
-				log.Debugf("flow %s was detected retry obj: %v at %d processing function result", f.name, cmp, i)
+				log.Debugf("pipe %s was detected retry obj: %v at %d processing function result", p.name, cmp, i)
 			}
 
-			// отправляем результат в указанные в outFlows потоки
+			// отправляем результат в указанные в outPipes потоки
 			for _, result := range results {
-				for _, target := range f.outFlows {
-					f.outCh <- flowOut[T]{
+				for _, target := range p.outPipes {
+					p.outCh <- pipeOut[T]{
 						target: target,
 						data:   result,
 					}
 				}
 			}
 		}
-		f.decPending()
+		p.decPending()
 	}
 }
 
-func (f *flow[T]) closeQueue(clear bool) error {
+func (p *pipe[T]) closeQueue(clear bool) error {
 	if clear {
-		return f.queue.Clear()
+		return p.queue.Clear()
 	}
 	return nil
 }

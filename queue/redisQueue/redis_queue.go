@@ -1,4 +1,4 @@
-package redis
+package redisQueue
 
 import (
 	"bytes"

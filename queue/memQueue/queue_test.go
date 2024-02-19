@@ -1,4 +1,4 @@
-package mem
+package memQueue
 
 import (
 	"testing"
@@ -14,9 +14,13 @@ func TestQueueIsEmpty(t *testing.T) {
 	}
 
 	// Add something
-	q.Push("Hello")
-	q.Push("world")
-	q.Push(":)")
+	err := q.Push("Hello")
+	if err != nil {
+		t.Fatal("push error")
+	}
+
+	_ = q.Push("world")
+	_ = q.Push(":)")
 
 	// Should have 3 elements
 	if q.IsEmpty() {
@@ -27,17 +31,17 @@ func TestQueueIsEmpty(t *testing.T) {
 		t.Fatal("The next returned incorrect value")
 	}
 
-	q.Next()
+	_, _, _ = q.Next()
 	if v := q.Peek(); v != ":)" {
 		t.Fatal("The peek returned incorrect value")
 	}
 
-	q.Next()
+	_, _, _ = q.Next()
 	if _, ok, _ := q.Next(); ok {
 		t.Fatal("The queue should be empty and returned empty type value and False")
 	}
 
-	q.Next()
+	_, _, _ = q.Next()
 
 	// Should be empty because we used all its elements
 	if !q.IsEmpty() {
