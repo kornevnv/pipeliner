@@ -1,0 +1,12 @@
+.vscode/
+.idea/
+.fleet/
+bin/*
+pkg/*
+data/*
+storage/*
+broker-data/*
+static/node_modules/
+static/dist/
+test-report.txt
+coverage.out
