@@ -50,8 +50,8 @@ type Pipeliner[T any] struct {
 	// флаг завершения работы
 	closed atomic.Bool
 
-	// счетчик объектов в обработке
-	pendingCnt atomic.Int64
+	// кол-во процессов, в текущий момент времени
+	pendingCount atomic.Int64
 
 	// сигнальные каналы завершения
 	doneCh    chan struct{}
@@ -134,6 +134,25 @@ func (p *Pipeliner[T]) Run(ctx context.Context) error {
 
 	wg.Wait()
 
+	// закрываем очереди
+	for _, pInst := range p.pipes() {
+		// ожидаем корректного завершения обработки
+		for {
+			pc := pInst.pendingCount.Load()
+			if pc == 0 {
+				break
+			}
+			time.Sleep(checkInterval)
+			log.Printf("queue: %s is pending: %d", pInst.name, pc)
+		}
+
+		err := pInst.closeQueue(false)
+		if err != nil {
+			log.Printf("close queue error: %s", err)
+		}
+		log.Printf("queue %s is closed", pInst.id)
+	}
+
 	return nil
 }
 
@@ -148,6 +167,12 @@ func (p *Pipeliner[T]) Suspend(force bool) {
 		p.pipeCancelFunc()
 	}
 
+}
+
+// EndWaitInput завершает ожидание ввода. с этого момента считается,
+// что мы можем получить данные только как результат выполнения
+func (p *Pipeliner[T]) EndWaitInput() {
+	p.waitInput.Store(false)
 }
 
 // CleanUP очищает очереди всех потоков
@@ -186,7 +211,9 @@ func (p *Pipeliner[T]) AddPipe(params PipeParams[T]) error {
 }
 
 // Push отправляет данные в соответствующий поток
-func (p *Pipeliner[T]) Push(name string, val ...T) error {
+func (p *Pipeliner[T]) Push(name string, vals ...T) error {
+	p.incPending()
+	defer p.decPending()
 	plInst, ok := p.pipe(name)
 	if !ok || plInst == nil {
 		return fmt.Errorf("pipe %s error %w", name, ErrPipeNotFound)
@@ -196,7 +223,7 @@ func (p *Pipeliner[T]) Push(name string, val ...T) error {
 		return ErrPipelinerClosed
 	}
 
-	return plInst.push(context.Background(), val...)
+	return plInst.push(context.TODO(), vals...)
 }
 
 func (p *Pipeliner[T]) pipe(name string) (*pipe[T], bool) {
@@ -226,7 +253,9 @@ func (p *Pipeliner[T]) watchResults(ctx context.Context) {
 	mChans := mergeChannels(pipesOutCh...)
 
 	for data := range mChans {
+		p.incPending()
 		err := p.Push(data.target, data.data)
+		p.decPending()
 		if err != nil {
 			log.Errorf("push data to pipe: %s error: %s", p.name, err)
 			continue
@@ -251,38 +280,45 @@ watchLoop:
 		case <-p.suspendCh:
 			break watchLoop
 		case <-ticker.C:
-			// если координатор ждет завершения ввода - продолжаем наблюдение
-			if p.waitInput.Load() {
-				continue
-			}
-			// если есть хоть один "живой" поток - продолжаем наблюдение
-			for _, plInst := range p.pipes() {
-				mc, pc := plInst.queue.Len(), plInst.pendingCount.Load()
-				if mc > 0 || pc > 0 {
-					log.Printf("queue: %s; messages in queue: %d; messages is pending: %d\n", plInst.name, mc, pc)
-					continue watchLoop
+			exit := func() bool {
+				// если координатор ждет завершения ввода - продолжаем наблюдение
+				if p.waitInput.Load() {
+					log.Printf("waiting end of input")
+					return false
 				}
-			}
-			// если мы дошли до этого кода - нет активных задач или получили сигнал выхода
-			break watchLoop
-		}
-	}
-	// закрываем очереди
-	for _, pInst := range p.pipes() {
-		// ожидаем корректного завершения обработки
-		for pc := pInst.pendingCount.Load(); pc != 0; pc = pInst.pendingCount.Load() {
-			time.Sleep(checkInterval)
-			log.Printf("queue: %s is pending: %d\n", pInst.name, pc)
-		}
+				if pc := p.pendingCount.Load(); pc > 0 {
+					log.Printf("pipeliner pending %d messages", pc)
+					return false
+				}
+				// если есть хоть один "живой" поток - продолжаем наблюдение
+				for _, plInst := range p.pipes() {
+					qc, pc := plInst.queue.Len(), plInst.pendingCount.Load()
+					if qc > 0 || pc > 0 {
+						log.Printf("queue: %s; messages in queue: %d; messages is pending: %d", plInst.name, qc, pc)
+						return false
+					}
+				}
+				return true
+			}()
 
-		err := pInst.closeQueue(false)
-		if err != nil {
-			log.Printf("close queue error: %s", err)
+			if exit {
+				// если мы дошли до этого кода - нет активных задач или получили сигнал выхода
+				break watchLoop
+			}
 		}
-		log.Printf("queue %s is closed", pInst.id)
 	}
 
 	log.Debugf("watchQueues is done")
+}
+
+// incPending увеличивает счетчик на 1
+func (p *Pipeliner[T]) incPending() {
+	p.pendingCount.Add(1)
+}
+
+// decPending уменьшает счетчик на 1
+func (p *Pipeliner[T]) decPending() {
+	p.pendingCount.Add(-1)
 }
 
 func mergeChannels[T any](cs ...chan T) <-chan T {

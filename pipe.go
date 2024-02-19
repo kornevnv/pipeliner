@@ -14,6 +14,7 @@ var (
 	errPipeNameIsNotSet       = errors.New("pipe name is not set")
 	errPipeProcFuncIsNotSet   = errors.New("pipe processing functions is not set")
 	errPipeAlreadyInitialized = errors.New("pipe queue is already initialized")
+	errPipeIsClosed           = errors.New("pipe is already closed")
 
 	defaultWorkerCount = 1
 )
@@ -51,8 +52,8 @@ type pipe[T any] struct {
 	// кол-во процессов, в текущий момент времени
 	pendingCount atomic.Int64
 
-	// флаг открытия потока. При отправке данных в поток - устанавливается в True
-	opened atomic.Bool
+	// флаг статуса потока
+	closed atomic.Bool
 
 	// флаг инициализации
 	initialized atomic.Bool
@@ -110,7 +111,17 @@ func (p *pipe[T]) incPending() {
 	p.pendingCount.Add(1)
 }
 
+// decPending уменьшает счетчик на 1
+func (p *pipe[T]) decPending() {
+	p.pendingCount.Add(-1)
+}
+
 func (p *pipe[T]) push(ctx context.Context, val ...T) error {
+	p.incPending()
+	defer p.decPending()
+	if p.closed.Load() {
+		return errPipeIsClosed
+	}
 	for _, v := range val {
 		err := p.queue.Push(v)
 		if err != nil {
@@ -120,14 +131,10 @@ func (p *pipe[T]) push(ctx context.Context, val ...T) error {
 	return nil
 }
 
-// decPending уменьшает счетчик на 1
-func (p *pipe[T]) decPending() {
-	p.pendingCount.Add(-1)
-}
-
 // run инициализирует пул воркеров и запускает на них обработку потока данных
 func (p *pipe[T]) run(ctx context.Context, doneCh, suspendCh chan struct{}) error {
 	defer close(p.outCh)
+
 	// проверка и установка флага инициализации
 	if p.initialized.Load() {
 		return errPipeAlreadyInitialized
@@ -173,15 +180,16 @@ watchLoop:
 		case <-suspendCh:
 			log.Debugf("stage %s context is done by suspend", p.id)
 			break watchLoop
-			// default:
 		case <-p.queue.Signal():
+			p.incPending()
 			next, ok, err := p.queue.Next()
+			p.decPending()
 			if !ok {
 				continue watchLoop
 			}
 			if err != nil {
 				log.Errorf("stage %s get next val error: %s", p.id, err)
-				continue
+				continue watchLoop
 			}
 			p.inCh <- next
 		}
@@ -210,7 +218,6 @@ func (p *pipe[T]) do(ctx context.Context) {
 }
 
 func (p *pipe[T]) runProcFunc(ctx context.Context, pfIdx int, val ...T) ([]T, []T, error) {
-
 	result, compensate, err := p.procFs[pfIdx](ctx, val...)
 	if err != nil {
 		if p.errF != nil {
@@ -218,7 +225,6 @@ func (p *pipe[T]) runProcFunc(ctx context.Context, pfIdx int, val ...T) ([]T, []
 		}
 		log.Debugf("pipe %s was detected error at %d processing function result", p.name, pfIdx)
 	}
-
 	for _, comp := range compensate {
 		p.outCh <- pipeOut[T]{
 			target: p.name,
@@ -238,6 +244,7 @@ func (p *pipe[T]) runProcFunc(ctx context.Context, pfIdx int, val ...T) ([]T, []
 }
 
 func (p *pipe[T]) closeQueue(clear bool) error {
+	p.closed.Store(true)
 	if clear {
 		return p.queue.Clear()
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/go-redis/redis/v7"
 	log "github.com/sirupsen/logrus"
@@ -14,6 +15,7 @@ type Queue[T any] struct {
 	client *redis.Client
 	name   string
 	signal chan struct{}
+	len    atomic.Int64
 }
 
 func New[T any](name string, options *redis.Options) (*Queue[T], error) {
@@ -24,11 +26,13 @@ func New[T any](name string, options *redis.Options) (*Queue[T], error) {
 		return nil, err
 	}
 
-	return &Queue[T]{
+	q := &Queue[T]{
 		client: c,
 		name:   name,
 		signal: make(chan struct{}, 1),
-	}, nil
+	}
+	q.len.Store(q.client.LLen(q.name).Val())
+	return q, nil
 }
 
 func (q *Queue[T]) Clear() error {
@@ -36,9 +40,12 @@ func (q *Queue[T]) Clear() error {
 }
 
 func (q *Queue[T]) Len() int {
-	l := q.client.LLen(q.name)
+	ilen := q.len.Load()
+	if ilen == 0 {
+		return int(q.client.LLen(q.name).Val())
+	}
 
-	return int(l.Val())
+	return int(ilen)
 }
 
 func (q *Queue[T]) Push(element T) error {
@@ -52,6 +59,7 @@ func (q *Queue[T]) Push(element T) error {
 		log.WithField("queue", q.name).Errorf("push val: %v error: %s", element, err)
 		return err
 	}
+	q.len.Add(1)
 
 	select {
 	case q.signal <- struct{}{}:
@@ -79,6 +87,7 @@ func (q *Queue[T]) Next() (T, bool, error) {
 		log.WithField("queue", q.name).Errorf("decode val: %v error: %s", val, err)
 		return item, false, fmt.Errorf("encode val error: %s", err)
 	}
+	q.len.Add(-1)
 
 	return item, true, nil
 }

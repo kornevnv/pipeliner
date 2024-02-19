@@ -20,7 +20,7 @@ const (
 	dialTimeout = 5 * time.Minute
 	// Timeout for socket reads.
 	readTimeout = dialTimeout
-	// Timeout for socket writes. If reached, commands will fail
+	// Timeout for redis socket writes. If reached, commands will fail
 	// with a timeout instead of blocking.
 	// Default is ReadTimeout.
 	writeTimeout = dialTimeout
@@ -83,7 +83,7 @@ func initPipeliner(ctx context.Context) (*pl.Pipeliner[Host], error) {
 	// возвращаем функцию инициализации очереди
 	redisQueueCF := useRedisQueue[Host]("localhost:6379", "password", 0)
 
-	proc, err := pl.NewPipeliner[Host]("cpt-active-1", false, redisQueueCF)
+	proc, err := pl.NewPipeliner[Host]("cpt-active-1", true, redisQueueCF)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +128,7 @@ func initPipeliner(ctx context.Context) (*pl.Pipeliner[Host], error) {
 	err = proc.AddPipe(pl.PipeParams[Host]{
 		Name:         "compensate",
 		WorkerCount:  1,
-		ProcessFuncs: []pl.ProcessFunc[Host]{compensate},
+		ProcessFuncs: []pl.ProcessFunc[Host]{compensate, compensate2},
 		OutPipes:     nil,
 	})
 	if err != nil {
@@ -182,9 +182,10 @@ func Run() error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		time.Sleep(1 * time.Second)
+		time.Sleep(3 * time.Second)
 		fmt.Println("PAUSE|CANCEL")
 		rts.SuspendFunc(false)
+		time.Sleep(3 * time.Second)
 		proc, err = initPipeliner(ctx)
 		if err != nil {
 			log.WithError(fmt.Errorf("init pipeliner error"))
@@ -195,14 +196,23 @@ func Run() error {
 		}
 	}()
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(60 * time.Second)
+		fmt.Println("END WAIT")
+		proc.EndWaitInput()
+	}()
+
 	wg.Wait()
 
 	a := r.Content()
+	fmt.Println(len(a))
 
 	// rts.CleanUPFunc()
 
-	if len(a) != 10002 {
-		return fmt.Errorf("struct must contains 10002 items")
+	if len(a) != 10003 {
+		return fmt.Errorf("struct must contains 10003 items")
 	}
 
 	return nil
@@ -217,6 +227,17 @@ func saveResults(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
 	return nil, nil, nil
 }
 
+func compensate2(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
+	fo2 := make([]Host, 0, len(fo))
+	for _, h := range fo {
+		if h.IP == "COMP-OK" {
+			r.Add("COMP-OK-2")
+		}
+	}
+
+	return fo2, nil, nil
+}
+
 func compensate(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
 	cmp := []Host{}
 	for _, h := range fo {
@@ -226,7 +247,7 @@ func compensate(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
 		}
 	}
 
-	return nil, cmp, nil
+	return fo, cmp, nil
 }
 
 func pf1(ctx context.Context, fo ...Host) ([]Host, []Host, error) {
