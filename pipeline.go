@@ -17,6 +17,7 @@ var (
 	ErrPipeNotFound          = errors.New("pipe not found")
 	ErrPipelinerClosed       = errors.New("pipeliner is closed")
 	ErrPipelinerNameRequired = errors.New("pipeliner name is required")
+	ErrPipeNameRequired      = errors.New("pipe name is required")
 	ErrCreteQueueFuncIsNil   = errors.New("create queue function is req required")
 )
 
@@ -79,9 +80,8 @@ func NewPipeliner[T any](id string, waitInput bool, cfq CreateQueueFunc[T]) (*Pi
 	}
 
 	f := &Pipeliner[T]{
-		name: id,
-		reg:  make(pipeRegistry[T]),
-		//	queueEngine: defaultQueueEngine,
+		name:      id,
+		reg:       make(pipeRegistry[T]),
 		cqf:       cfq,
 		doneCh:    make(chan struct{}),
 		suspendCh: make(chan struct{}),
@@ -93,7 +93,7 @@ func NewPipeliner[T any](id string, waitInput bool, cfq CreateQueueFunc[T]) (*Pi
 }
 
 // Run запускает основной процесс выполнения координатора
-// запускает процессы обработки всех потоков (fl.run),
+// запускает процессы обработки всех потоков (pipe.run),
 // процесс отслеживания состояния очередей для завершения (watchQueues),
 // процесс обработки результатов работы потоков (watchResults)
 func (p *Pipeliner[T]) Run(ctx context.Context) error {
@@ -108,9 +108,9 @@ func (p *Pipeliner[T]) Run(ctx context.Context) error {
 	// запуск потоков
 	for _, pInst := range pipes {
 		wg.Add(1)
-		go func(fl *pipe[T]) {
+		go func(plInst *pipe[T]) {
 			defer wg.Done()
-			err := fl.run(pipeCtx, p.doneCh, p.suspendCh)
+			err := plInst.run(pipeCtx, p.doneCh, p.suspendCh)
 			if err != nil {
 				log.Errorf("Run pipeliner error: %s", err)
 			}
@@ -137,7 +137,9 @@ func (p *Pipeliner[T]) Run(ctx context.Context) error {
 	return nil
 }
 
-// Suspend останавливает процесс обработки
+// Suspend останавливает процесс обработки.
+// флаг force указывает на необходимость отмены контекста дочерних процессов,
+// не дожидается завершения обработки уже отправленных в processFunc данных
 func (p *Pipeliner[T]) Suspend(force bool) {
 	close(p.suspendCh)
 
@@ -161,29 +163,32 @@ func (p *Pipeliner[T]) CleanUP() error {
 
 // AddPipe регистрирует поток в координаторе.
 // Создает соответсвующую очередь
-func (p *Pipeliner[T]) AddPipe(name string, wc int, out []string, pf ...processFunc[T]) error {
+func (p *Pipeliner[T]) AddPipe(params PipeParams[T]) error {
 	if p.closed.Load() {
 		return ErrPipelinerClosed
 	}
+	if params.Name == "" {
+		return ErrPipeNameRequired
+	}
 
-	q, err := p.cqf(p.name + "-" + name)
+	q, err := p.cqf(p.name + "-" + params.Name)
 	if err != nil {
 		return fmt.Errorf("create queue error: %s", err)
 	}
 
-	fl, err := newPipe(p.name, name, q, out, wc, pf...)
+	pInst, err := newPipe(p.name, q, params)
 	if err != nil {
 		return err
 	}
 
-	p.addPipe(name, fl)
+	p.addPipe(params.Name, pInst)
 	return nil
 }
 
 // Push отправляет данные в соответствующий поток
-func (p *Pipeliner[T]) Push(name string, val T) error {
-	fl, ok := p.pipe(name)
-	if !ok || fl == nil {
+func (p *Pipeliner[T]) Push(name string, val ...T) error {
+	plInst, ok := p.pipe(name)
+	if !ok || plInst == nil {
 		return fmt.Errorf("pipe %s error %w", name, ErrPipeNotFound)
 	}
 
@@ -191,16 +196,16 @@ func (p *Pipeliner[T]) Push(name string, val T) error {
 		return ErrPipelinerClosed
 	}
 
-	return fl.push(context.Background(), val)
+	return plInst.push(context.Background(), val...)
 }
 
 func (p *Pipeliner[T]) pipe(name string) (*pipe[T], bool) {
-	fl, ok := p.reg[name]
-	return fl, ok
+	plInst, ok := p.reg[name]
+	return plInst, ok
 }
 
-func (p *Pipeliner[T]) addPipe(name string, fl *pipe[T]) {
-	p.reg[name] = fl
+func (p *Pipeliner[T]) addPipe(name string, plInst *pipe[T]) {
+	p.reg[name] = plInst
 }
 
 func (p *Pipeliner[T]) pipes() pipeRegistry[T] {
@@ -251,10 +256,10 @@ watchLoop:
 				continue
 			}
 			// если есть хоть один "живой" поток - продолжаем наблюдение
-			for _, fl := range p.pipes() {
-				mc, pc := fl.queue.Len(), fl.pendingCount.Load()
+			for _, plInst := range p.pipes() {
+				mc, pc := plInst.queue.Len(), plInst.pendingCount.Load()
 				if mc > 0 || pc > 0 {
-					log.Printf("queue: %s; messages in queue: %d; messages is pending: %d\n", fl.name, mc, pc)
+					log.Printf("queue: %s; messages in queue: %d; messages is pending: %d\n", plInst.name, mc, pc)
 					continue watchLoop
 				}
 			}

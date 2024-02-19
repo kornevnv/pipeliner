@@ -16,12 +16,8 @@ type Queue[T any] struct {
 	signal chan struct{}
 }
 
-func New[T any](addr, password string, db int, name string) (*Queue[T], error) {
-	c := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-	})
+func New[T any](name string, options *redis.Options) (*Queue[T], error) {
+	c := redis.NewClient(options)
 
 	err := c.Ping().Err()
 	if err != nil {
