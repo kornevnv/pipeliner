@@ -16,7 +16,7 @@ const checkInterval = 3 * time.Second
 var (
 	ErrPipeNotFound          = errors.New("pipe not found")
 	ErrPipelinerClosed       = errors.New("pipeliner is closed")
-	ErrPipelinerStarted      = errors.New("pipeliner is startes")
+	ErrPipelinerStarted      = errors.New("pipeliner is started")
 	ErrPipelinerNameRequired = errors.New("pipeliner name is required")
 	ErrPipeNameRequired      = errors.New("pipe name is required")
 	ErrCreteQueueFuncIsNil   = errors.New("create queue function is req required")
