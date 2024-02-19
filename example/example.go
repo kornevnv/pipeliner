@@ -1,6 +1,6 @@
 // nolint
 
-package example
+package main
 
 import (
 	"context"
@@ -137,6 +137,13 @@ func initPipeliner(ctx context.Context) (*pl.Pipeliner[Host], error) {
 	return proc, nil
 }
 
+func main() {
+	err := Run()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -179,18 +186,20 @@ func Run() error {
 		}
 	}()
 
+	proc2 := &pl.Pipeliner[Host]{}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		time.Sleep(3 * time.Second)
 		fmt.Println("PAUSE|CANCEL")
-		rts.SuspendFunc(false)
+		rts.SuspendFunc(true)
 		time.Sleep(3 * time.Second)
-		proc, err = initPipeliner(ctx)
+		proc2, err = initPipeliner(ctx)
 		if err != nil {
 			log.WithError(fmt.Errorf("init pipeliner error"))
 		}
-		err = proc.Run(ctx)
+		err = proc2.Run(ctx)
 		if err != nil {
 			log.WithError(fmt.Errorf("run pipeliner error"))
 		}
@@ -199,9 +208,13 @@ func Run() error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		time.Sleep(60 * time.Second)
-		fmt.Println("END WAIT")
+		time.Sleep(15 * time.Second)
+		fmt.Println("END WAIT proc")
+
 		proc.EndWaitInput()
+		time.Sleep(15 * time.Second)
+		fmt.Println("END WAIT proc2")
+		proc2.EndWaitInput()
 	}()
 
 	wg.Wait()

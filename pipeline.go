@@ -16,6 +16,7 @@ const checkInterval = 3 * time.Second
 var (
 	ErrPipeNotFound          = errors.New("pipe not found")
 	ErrPipelinerClosed       = errors.New("pipeliner is closed")
+	ErrPipelinerStarted      = errors.New("pipeliner is startes")
 	ErrPipelinerNameRequired = errors.New("pipeliner name is required")
 	ErrPipeNameRequired      = errors.New("pipe name is required")
 	ErrCreteQueueFuncIsNil   = errors.New("create queue function is req required")
@@ -46,6 +47,9 @@ type Pipeliner[T any] struct {
 
 	// флаг ожидания окончания ввода данных
 	waitInput atomic.Bool
+
+	// флаг запуска
+	started atomic.Bool
 
 	// флаг завершения работы
 	closed atomic.Bool
@@ -86,7 +90,6 @@ func NewPipeliner[T any](id string, waitInput bool, cfq CreateQueueFunc[T]) (*Pi
 		doneCh:    make(chan struct{}),
 		suspendCh: make(chan struct{}),
 	}
-
 	f.waitInput.Store(waitInput)
 
 	return f, nil
@@ -99,6 +102,8 @@ func NewPipeliner[T any](id string, waitInput bool, cfq CreateQueueFunc[T]) (*Pi
 func (p *Pipeliner[T]) Run(ctx context.Context) error {
 	defer p.closed.Store(true)
 	var wg sync.WaitGroup
+
+	p.started.Store(true)
 
 	pipeCtx, cancel := context.WithCancel(ctx)
 	p.pipeCancelFunc = cancel
@@ -192,6 +197,11 @@ func (p *Pipeliner[T]) AddPipe(params PipeParams[T]) error {
 	if p.closed.Load() {
 		return ErrPipelinerClosed
 	}
+
+	if p.started.Load() {
+		return ErrPipelinerStarted
+	}
+
 	if params.Name == "" {
 		return ErrPipeNameRequired
 	}
