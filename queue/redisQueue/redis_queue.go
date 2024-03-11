@@ -6,16 +6,22 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-redis/redis/v7"
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	retryDelay = 3 * time.Second
+)
+
 type Queue[T any] struct {
-	client *redis.Client
-	name   string
-	signal chan struct{}
-	len    atomic.Int64
+	client  *redis.Client
+	name    string
+	signal  chan struct{}
+	len     atomic.Int64
+	options *redis.Options
 }
 
 func New[T any](name string, options *redis.Options) (*Queue[T], error) {
@@ -27,12 +33,17 @@ func New[T any](name string, options *redis.Options) (*Queue[T], error) {
 	}
 
 	q := &Queue[T]{
-		client: c,
-		name:   name,
-		signal: make(chan struct{}, 1),
+		client:  c,
+		name:    name,
+		signal:  make(chan struct{}, 1),
+		options: options,
 	}
 	q.len.Store(q.client.LLen(q.name).Val())
 	return q, nil
+}
+
+func (q *Queue[T]) reconnect() {
+	q.client = redis.NewClient(q.options)
 }
 
 func (q *Queue[T]) Clear() error {
@@ -42,7 +53,14 @@ func (q *Queue[T]) Clear() error {
 func (q *Queue[T]) Len() int {
 	ilen := q.len.Load()
 	if ilen == 0 {
-		return int(q.client.LLen(q.name).Val())
+		qlen := q.client.LLen(q.name)
+		if qlen != nil || qlen.Err() != nil {
+			log.WithField("queue", q.name).Errorf("queue: %v get len error", q.name)
+			time.Sleep(retryDelay)
+			q.reconnect()
+			return q.Len()
+		}
+		return int(qlen.Val())
 	}
 
 	return int(ilen)
@@ -52,7 +70,9 @@ func (q *Queue[T]) Push(element T) error {
 	encodedVal, err := encode(element)
 	if err != nil {
 		log.WithField("queue", q.name).Errorf("encode val: %v error: %s", element, err)
-		return fmt.Errorf("encode val error: %s", err)
+		time.Sleep(retryDelay)
+		q.reconnect()
+		return q.Push(element)
 	}
 	_, err = q.client.LPush(q.name, encodedVal).Result()
 	if err != nil {
@@ -78,8 +98,10 @@ func (q *Queue[T]) Next() (T, bool, error) {
 
 	val, err := q.client.RPop(q.name).Result()
 	if err != nil {
-		log.WithField("queue", q.name).Errorf("empry pop val form queue: %s", q.name)
-		return item, false, fmt.Errorf("get val error: %s", err)
+		log.WithField("queue", q.name).Errorf("pop val form queue: %s error: %s", q.name, err)
+		time.Sleep(retryDelay)
+		q.reconnect()
+		return q.Next()
 	}
 
 	err = decode(val, &item)

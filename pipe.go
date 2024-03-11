@@ -21,7 +21,7 @@ var (
 
 // ProcessFunc процессинговая функция. Возвращает массив обработанных результатов,
 // массив результатов компенсации (тех объектов, которые не были обработаны) и ошибку
-type ProcessFunc[T any] func(ctx context.Context, input ...T) (results []T, compensate []T, err error)
+type ProcessFunc[T any] func(ctx context.Context, input ...T) (results []T, retry []T, err error)
 
 // errFunc функция обработки ошибок
 type errFunc func(context.Context, error)
@@ -78,7 +78,7 @@ type PipeParams[T any] struct {
 // newPipe инициализирует экземпляр потока данных.
 // обработка происходит по всем указанным processFunc ПОСЛЕДОВАТЕЛЬНО!
 // т.е. pf1 -> pf2 -> pf3, и только после выполнения всех - результат уходит в outF.
-// compensate обрабатывается из всех processFunc
+// retry обрабатывается из всех processFunc
 func newPipe[T any](pipelinerName string, q Queue[T], params PipeParams[T]) (*pipe[T], error) {
 	if len(params.ProcessFuncs) == 0 {
 		return nil, errPipeProcFuncIsNotSet
@@ -204,7 +204,12 @@ func (p *pipe[T]) do(ctx context.Context) {
 		// увеличиваем счетчик ожидания и последовательно выполняем процессинговые функции
 		// отправляем ошибки в функцию обработки, если она определена
 		p.incPending()
-		results, _, _ := p.runProcFunc(ctx, 0, val)
+
+		// retry не обрабатываем, т.к. он уже обработан в runProcFunc
+		results, _, err := p.runProcFunc(ctx, 0, val)
+		if p.errF != nil {
+			p.errF(ctx, err)
+		}
 		for _, result := range results {
 			for _, target := range p.outPipes {
 				p.outCh <- pipeOut[T]{
@@ -218,19 +223,19 @@ func (p *pipe[T]) do(ctx context.Context) {
 }
 
 func (p *pipe[T]) runProcFunc(ctx context.Context, pfIdx int, val ...T) ([]T, []T, error) {
-	result, compensate, err := p.procFs[pfIdx](ctx, val...)
+	result, retry, err := p.procFs[pfIdx](ctx, val...)
 	if err != nil {
 		if p.errF != nil {
 			p.errF(ctx, err)
 		}
 		log.Debugf("pipe %s was detected error at %d processing function result", p.name, pfIdx)
 	}
-	for _, comp := range compensate {
+	for _, r := range retry {
 		p.outCh <- pipeOut[T]{
 			target: p.name,
-			data:   comp,
+			data:   r,
 		}
-		log.Debugf("pipe %s was detected retry objs count: %v at %d processing function result", p.name, comp, pfIdx)
+		log.Debugf("pipe %s was detected retry objs count: %v at %d processing function result", p.name, r, pfIdx)
 	}
 
 	// если это не последня функция - замыкаем

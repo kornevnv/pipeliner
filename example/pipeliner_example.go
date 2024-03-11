@@ -11,9 +11,9 @@ import (
 	"github.com/go-redis/redis/v7"
 	log "github.com/sirupsen/logrus"
 
-	pl "pipeliner"
+	pl "sdg-gitlab.solar.local/golang/pipeliner.git"
 
-	rq "pipeliner/queue/redisQueue"
+	rq "sdg-gitlab.solar.local/golang/pipeliner.git/queue/redisQueue"
 )
 
 const (
@@ -29,24 +29,6 @@ const (
 type Host struct {
 	IP      string
 	Domains []string
-}
-
-type res struct {
-	mu sync.Mutex
-
-	data []string
-}
-
-func (r *res) Add(v string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.data = append(r.data, v)
-}
-
-func (r *res) Content() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.data
 }
 
 var r = new(res)
@@ -194,7 +176,7 @@ func Run() error {
 		time.Sleep(3 * time.Second)
 		fmt.Println("PAUSE|CANCEL")
 		rts.SuspendFunc(true)
-		time.Sleep(3 * time.Second)
+		time.Sleep(10 * time.Second)
 		proc2, err = initPipeliner(ctx)
 		if err != nil {
 			log.WithError(fmt.Errorf("init pipeliner error"))
