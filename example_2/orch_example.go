@@ -243,7 +243,7 @@ func (s *Step1[T]) stepF(ctx context.Context, fo Host) (bool, error) {
 		_ = s.step2.Publish(ctx, res[i])
 	}
 
-	return false, nil
+	return true, nil
 
 }
 
@@ -264,7 +264,7 @@ func (s *Step2[T]) stepF(ctx context.Context, fo Host) (bool, error) {
 		_ = s.step3.Publish(ctx, res[i])
 	}
 
-	return false, nil
+	return true, nil
 }
 
 type Step3[T Host] struct {
@@ -286,7 +286,7 @@ func (s *Step3[T]) stepF(ctx context.Context, fo Host) (bool, error) {
 		_ = s.saveDB.Publish(ctx, res[i])
 	}
 	// res = append(res, Host{IP: "FO-COMP"})
-	return false, nil
+	return true, nil
 }
 
 type StepComp[T Host] struct {
@@ -299,12 +299,12 @@ type StepComp[T Host] struct {
 func (s *StepComp[T]) stepF(ctx context.Context, fo Host) (bool, error) {
 	if fo.IP == "COMP" && !s.wasRetry {
 		s.wasRetry = true
-		return true, nil
+		return false, nil
 	}
 
 	_ = s.saveDB.Publish(ctx, fo)
 
-	return false, nil
+	return true, nil
 }
 
 type StepSaveResult[T Host] struct {
@@ -315,5 +315,5 @@ func (s *StepSaveResult[T]) saveResults(ctx context.Context, fo Host) (bool, err
 
 	r.Add(fo.IP)
 
-	return false, nil
+	return true, nil
 }
