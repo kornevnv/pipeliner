@@ -54,7 +54,7 @@ func (q *Queue[T]) Len() int {
 	ilen := q.len.Load()
 	if ilen == 0 {
 		qlen := q.client.LLen(q.name)
-		if qlen != nil || qlen.Err() != nil {
+		if qlen == nil || qlen.Err() != nil {
 			log.WithField("queue", q.name).Errorf("queue: %v get len error", q.name)
 			time.Sleep(retryDelay)
 			q.reconnect()
