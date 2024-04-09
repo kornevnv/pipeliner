@@ -12,7 +12,8 @@ import (
 	"github.com/go-redis/redis/v7"
 	log "github.com/sirupsen/logrus"
 
-	"sdg-gitlab.solar.local/golang/pipeliner.git/go-saga/step"
+	"sdg-gitlab.solar.local/golang/pipeliner.git/edp/processor"
+	"sdg-gitlab.solar.local/golang/pipeliner.git/edp/step"
 	rq "sdg-gitlab.solar.local/golang/pipeliner.git/queue/redisQueue"
 )
 
@@ -82,9 +83,9 @@ func Run() error {
 	gc := &GlobalCounter{}
 	ctx, cancel := context.WithCancel(context.Background())
 
-	orchName := "cpt-active"
+	pName := "cpt-active"
 
-	orch, err := coordinator.NewOrchestrator(orchName, gc, true)
+	p1, err := processor.New(pName, gc, true)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("init orchestrator error")
@@ -98,7 +99,7 @@ func Run() error {
 
 	// SAVE To DB
 	stSave := &StepSaveResult[Host]{Name: "step-save"}
-	stSaveQ, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", orchName, stSave.Name))
+	stSaveQ, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, stSave.Name))
 	stepSave, _ = step.NewStep[Host](stSave.Name, stSaveQ, 1, gc, nil, stSave.saveResults, nil)
 
 	// COMPENSATE
@@ -107,7 +108,7 @@ func Run() error {
 		saveDB:   stepSave,
 		wasRetry: false,
 	}
-	stCompQ, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", orchName, stComp.Name))
+	stCompQ, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, stComp.Name))
 	stepComp, _ = step.NewStep[Host](stComp.Name, stCompQ, 1, gc, nil, stComp.stepF, nil)
 
 	// STEP 3
@@ -115,7 +116,7 @@ func Run() error {
 		Name:   "step-3",
 		saveDB: stepSave,
 	}
-	st3Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", orchName, st3.Name))
+	st3Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, st3.Name))
 	step3, _ = step.NewStep[Host](st3.Name, st3Q, 1, gc, nil, st3.stepF, nil)
 
 	// STEP 2
@@ -123,20 +124,20 @@ func Run() error {
 		Name:  "step-2",
 		step3: step3,
 	}
-	st2Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", orchName, st2.Name))
+	st2Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, st2.Name))
 	step2, _ = step.NewStep[Host](st2.Name, st2Q, 1, gc, nil, st2.stepF, nil)
 
 	st1 := &Step1[Host]{
 		Name:  "step-1",
 		step2: step2,
 	}
-	st1Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", orchName, st1.Name))
+	st1Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, st1.Name))
 	step1, _ = step.NewStep[Host](st1.Name, st1Q, 1, gc, nil, st1.stepF, nil)
 
 	rts := TaskController{
 		CancelFunc:  cancel,
-		SuspendFunc: orch.Suspend,
-		CleanUPFunc: orch.CleanUP,
+		SuspendFunc: p1.Suspend,
+		CleanUPFunc: p1.CleanUP,
 	}
 	_ = rts
 
@@ -156,19 +157,19 @@ func Run() error {
 		log.WithError(err).Errorf("")
 	}
 
-	_ = orch.RegSteps(step1, step2, step3, stepSave, stepComp)
+	_ = p1.RegSteps(step1, step2, step3, stepSave, stepComp)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err = orch.Run(ctx)
+		err = p1.Run(ctx)
 		if err != nil {
 			log.WithError(err).Errorf("")
 		}
 	}()
 
-	orch2 := &coordinator.Coordinator{}
+	p2 := &processor.Processor{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -177,7 +178,7 @@ func Run() error {
 		// rts.SuspendFunc(true)
 		time.Sleep(10 * time.Second)
 
-		orch2, err = coordinator.NewOrchestrator(orchName, gc, true)
+		p2, err = processor.New(pName, gc, true)
 		if err != nil {
 			cancel()
 			log.Errorf("init orchestrator error")
@@ -188,9 +189,9 @@ func Run() error {
 		step2_2, _ := step.NewStep[Host](st2.Name, st2Q, 1, gc, nil, st2.stepF, nil)
 		step1_2, _ := step.NewStep[Host](st1.Name, st1Q, 1, gc, nil, st1.stepF, nil)
 
-		_ = orch2.RegSteps(step1_2, step2_2, step3_2, stepSave_2, stepComp_2)
+		_ = p2.RegSteps(step1_2, step2_2, step3_2, stepSave_2, stepComp_2)
 
-		err = orch2.Run(ctx)
+		err = p2.Run(ctx)
 		if err != nil {
 			log.WithError(fmt.Errorf("run pipeliner error"))
 		}
@@ -202,10 +203,10 @@ func Run() error {
 		time.Sleep(15 * time.Second)
 		fmt.Println("END WAIT proc")
 
-		orch.EndWaitInput()
+		p1.EndWaitInput()
 		time.Sleep(10 * time.Second)
 		fmt.Println("END WAIT proc2")
-		orch2.EndWaitInput()
+		p2.EndWaitInput()
 	}()
 
 	wg.Wait()
