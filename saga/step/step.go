@@ -3,15 +3,15 @@ package step
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
-
-	log "github.com/sirupsen/logrus"
 )
 
 var (
-	errStepNameIsRequired = errors.New("step name is required")
-	errStepIsClosed       = errors.New("step is closed")
+	errStepNameIsRequired   = errors.New("step name is required")
+	errStepIsClosed         = errors.New("step is closed")
+	errStepIsNotInitialized = errors.New("step is not initialized, use *step.Init(...)")
 
 	defaultWorkerCount = 1
 )
@@ -33,11 +33,11 @@ type Counter interface {
 	Count() int64
 }
 
-// ProcessFunc процессинговая функция. Возвращает флаг необходимости ретрая (!ok) и ошибку.
-// retry производится путем повторной публикации объекта в очередь
+// ProcessFunc процессинговая функция. Возвращает флаг необходимости ретрая и ошибку.
+// retry (!ok) производится путем повторной публикации объекта в очередь
 type ProcessFunc[T any] func(ctx context.Context, input T) (ok bool, err error)
 
-// FilterFunc фильтрующая функция. Выполняется ДО процессинговой функции
+// FilterFunc фильтрующая функция. Выполняется ДО процессинговой функции.
 type FilterFunc[T any] func(ctx context.Context, input T) (output *T, err error)
 
 // ErrorFunc функция обработки ошибок
@@ -67,6 +67,8 @@ type Step[T any] struct {
 
 	// канал входных данных
 	inChan chan T
+
+	initialized atomic.Bool
 }
 
 // Name возвращает имя этапа
@@ -74,8 +76,8 @@ func (s *Step[T]) Name() string {
 	return s.name
 }
 
-// NewStep конструктор этапа
-func NewStep[T any](
+// Init инициализирует этап
+func (s *Step[T]) Init(
 	name string,
 	queue Queue[T],
 	workerCnt int,
@@ -83,9 +85,9 @@ func NewStep[T any](
 	filterFunc FilterFunc[T],
 	processFunc ProcessFunc[T],
 	errorFunc ErrorFunc,
-) (*Step[T], error) {
+) error {
 	if name == "" {
-		return nil, errStepNameIsRequired
+		return errStepNameIsRequired
 	}
 
 	// устанавливаем кол-во воркеров по умолчанию, если не задано
@@ -93,20 +95,24 @@ func NewStep[T any](
 		workerCnt = defaultWorkerCount
 	}
 
-	return &Step[T]{
-		name:              name,
-		workerCount:       workerCnt,
-		pendingOpsCounter: counter,
-		queue:             queue,
-		inChan:            make(chan T),
-		filterFunc:        filterFunc,
-		procFunc:          processFunc,
-		errFunc:           errorFunc,
-	}, nil
+	s.name = name
+	s.workerCount = workerCnt
+	s.pendingOpsCounter = counter
+	s.queue = queue
+	s.inChan = make(chan T)
+	s.filterFunc = filterFunc
+	s.procFunc = processFunc
+	s.errFunc = errorFunc
+
+	s.initialized.Store(true)
+	return nil
 }
 
-// Publish публикует событие с соответствующим типом в очередь этапа
-func (s *Step[T]) Publish(_ context.Context, val T) error {
+// Put публикует событие с соответствующим типом в очередь этапа
+func (s *Step[T]) Put(_ context.Context, val T) error {
+	if !s.initialized.Load() {
+		return errStepIsNotInitialized
+	}
 	s.pendingOpsCounter.Inc()
 	defer s.pendingOpsCounter.Dec()
 	if s.closed.Load() {
@@ -122,6 +128,9 @@ func (s *Step[T]) Publish(_ context.Context, val T) error {
 
 // Close закрывает этап, при clean == true - очищает очередь этапа
 func (s *Step[T]) Close(_ context.Context, clear bool) error {
+	if !s.initialized.Load() {
+		return errStepIsNotInitialized
+	}
 	s.closed.Store(true)
 	if clear {
 		return s.queue.Clear()
@@ -136,13 +145,10 @@ watchLoop:
 	for {
 		select {
 		case <-ctx.Done():
-			log.Debugf("step %s is canceled", s.name)
 			break watchLoop
 		case <-doneCh:
-			log.Debugf("step %s context is done", s.name)
 			break watchLoop
 		case <-suspendCh:
-			log.Debugf("step %s context is done by suspend", s.name)
 			break watchLoop
 		case <-s.queue.Signal():
 			s.pendingOpsCounter.Inc()
@@ -152,17 +158,20 @@ watchLoop:
 				continue watchLoop
 			}
 			if err != nil {
-				log.Errorf("step %s get next val error: %s", s.name, err)
+				s.errHandling(ctx, fmt.Errorf("step %s get next val error: %s", s.name, err))
 				continue watchLoop
 			}
 			s.inChan <- next
 		}
 	}
-	log.Debugf("readQueue is done")
 }
 
 // Run инициализирует пул воркеров и запускает на них обработку потока данных
 func (s *Step[T]) Run(ctx context.Context, doneCh, suspendCh chan struct{}) error {
+	if !s.initialized.Load() {
+		return errStepIsNotInitialized
+	}
+
 	var wg sync.WaitGroup
 
 	// инициализируем пул воркеров
@@ -180,8 +189,6 @@ func (s *Step[T]) Run(ctx context.Context, doneCh, suspendCh chan struct{}) erro
 		s.readQueue(ctx, doneCh, suspendCh)
 	}()
 	wg.Wait()
-
-	log.Debugf("step run is done")
 
 	return nil
 }
@@ -206,7 +213,7 @@ func (s *Step[T]) do(ctx context.Context) {
 
 		// производим ретрай, при необходимости
 		if !ok {
-			err := s.Publish(ctx, val)
+			err := s.Put(ctx, val)
 			s.errHandling(ctx, err)
 		}
 		s.pendingOpsCounter.Dec()

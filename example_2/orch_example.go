@@ -12,9 +12,10 @@ import (
 	"github.com/go-redis/redis/v7"
 	log "github.com/sirupsen/logrus"
 
-	"sdg-gitlab.solar.local/golang/pipeliner.git/edp/processor"
-	"sdg-gitlab.solar.local/golang/pipeliner.git/edp/step"
+	"sdg-gitlab.solar.local/golang/pipeliner.git/saga/step"
+
 	rq "sdg-gitlab.solar.local/golang/pipeliner.git/queue/redisQueue"
+	"sdg-gitlab.solar.local/golang/pipeliner.git/saga/coordinator"
 )
 
 const (
@@ -85,7 +86,7 @@ func Run() error {
 
 	pName := "cpt-active"
 
-	p1, err := processor.New(pName, gc, true)
+	p1, err := coordinator.New(pName, gc, true)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("init orchestrator error")
@@ -127,7 +128,7 @@ func Run() error {
 	st2Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, st2.Name))
 	step2, _ = step.NewStep[Host](st2.Name, st2Q, 1, gc, nil, st2.stepF, nil)
 
-	st1 := &Step1[Host]{
+	st1 := &Step1{
 		Name:  "step-1",
 		step2: step2,
 	}
@@ -169,7 +170,7 @@ func Run() error {
 		}
 	}()
 
-	p2 := &processor.Processor{}
+	p2 := &coordinator.Coordinator{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -178,7 +179,7 @@ func Run() error {
 		// rts.SuspendFunc(true)
 		time.Sleep(10 * time.Second)
 
-		p2, err = processor.New(pName, gc, true)
+		p2, err = coordinator.New(pName, gc, true)
 		if err != nil {
 			cancel()
 			log.Errorf("init orchestrator error")
@@ -224,12 +225,12 @@ func Run() error {
 
 }
 
-type Step1[T Host] struct {
+type Step1 struct {
 	Name  string
 	step2 *step.Step[Host]
 }
 
-func (s *Step1[T]) stepF(ctx context.Context, fo Host) (bool, error) {
+func (s *Step1) stepF(ctx context.Context, fo Host) (bool, error) {
 	// n := rand.Intn(1) // n will be between 0 and 10
 	// time.Sleep(time.Duration(n) * time.Second)
 	fmt.Println(s.Name)

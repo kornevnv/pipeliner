@@ -1,8 +1,9 @@
-package processor
+package coordinator
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,9 +15,9 @@ import (
 const checkInterval = 3 * time.Second
 
 var (
-	ErrEmptyProcessor        = errors.New("processor is empty")
-	ErrProcessorClosed       = errors.New("processor is closed")
-	ErrProcessorNameRequired = errors.New("processor name is required")
+	ErrEmpty        = errors.New("coordinator is empty")
+	ErrClosed       = errors.New("coordinator is closed")
+	ErrNameRequired = errors.New("coordinator name is required")
 )
 
 type StepInstance interface {
@@ -35,9 +36,9 @@ type Counter interface {
 // stepRegistry используется для хранения экземпляров этапов
 type stepRegistry map[string]StepInstance
 
-// Processor экземпляр управляющей структуры.
-// Запускает и отслеживает все этапы, отслеживает счетчик активных задач
-type Processor struct {
+// Coordinator экземпляр управляющей структуры.
+// Запускает и отслеживает все этапы, отслеживает счетчик активных задач.
+type Coordinator struct {
 	// уникальный идентификатор
 	name string
 
@@ -62,13 +63,13 @@ type Processor struct {
 	reg stepRegistry
 }
 
-// New создает новый экземпляр процессора
-func New(name string, counter Counter, waitInput bool) (*Processor, error) {
+// New создает новый экземпляр координатора.
+func New(name string, counter Counter, waitInput bool) (*Coordinator, error) {
 	if name == "" {
-		return nil, ErrProcessorNameRequired
+		return nil, ErrNameRequired
 	}
 
-	f := &Processor{
+	f := &Coordinator{
 		name:      name,
 		reg:       make(stepRegistry),
 		doneCh:    make(chan struct{}),
@@ -80,28 +81,29 @@ func New(name string, counter Counter, waitInput bool) (*Processor, error) {
 	return f, nil
 }
 
-// Run запускает основной процесс выполнения
+// Run запускает основной процесс выполнения.
 // запускает процессы обработки всех потоков (step.run),
 // процесс отслеживания состояния очередей для завершения (watchQueues),
-// процесс обработки результатов работы потоков (watchResults)
-func (p *Processor) Run(ctx context.Context) error {
-	defer p.closed.Store(true)
+// процесс обработки результатов работы потоков (watchResults).
+// Процессы запускаются только для тех этапов, которые зарегистрированы через RegSteps.
+func (c *Coordinator) Run(ctx context.Context) error {
+	defer c.closed.Store(true)
 
-	if len(p.reg) == 0 {
-		return ErrEmptyProcessor
+	if len(c.reg) == 0 {
+		return ErrEmpty
 	}
 
 	var wg sync.WaitGroup
 
 	stepCtx, cancel := context.WithCancel(ctx)
-	p.stepCancelFunc = cancel
+	c.stepCancelFunc = cancel
 
 	// запуск процессов обработки очередей
-	for _, step := range p.reg {
+	for _, step := range c.reg {
 		wg.Add(1)
 		go func(step StepInstance) {
 			defer wg.Done()
-			err := step.Run(stepCtx, p.doneCh, p.suspendCh)
+			err := step.Run(stepCtx, c.doneCh, c.suspendCh)
 			if err != nil {
 				log.Errorf("run step %s error: %s", step.Name(), err)
 			}
@@ -112,19 +114,18 @@ func (p *Processor) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		p.watchQueues(ctx)
-		close(p.doneCh)
+		c.watchQueues(ctx)
+		close(c.doneCh)
 	}()
 
 	wg.Wait()
 
 	// закрываем этапы и очереди
-	for _, step := range p.reg {
+	for _, step := range c.reg {
 		err := step.Close(ctx, false)
 		if err != nil {
-			log.Debugf("close queue error: %s", err)
+			return fmt.Errorf("close queue error: %s", err)
 		}
-		log.Debugf("step %s: queue is closed", step.Name())
 	}
 
 	return nil
@@ -132,26 +133,25 @@ func (p *Processor) Run(ctx context.Context) error {
 
 // Suspend останавливает процесс обработки.
 // флаг force указывает на необходимость отмены контекста дочерних процессов,
-// не дожидается завершения обработки уже отправленных в processFunc данных
-func (p *Processor) Suspend(force bool) {
-	close(p.suspendCh)
+// не дожидается завершения обработки уже отправленных в processFunc данных.
+func (c *Coordinator) Suspend(force bool) {
+	close(c.suspendCh)
 
 	if force {
 		// отменяем контекст потоков, чтобы донести отмену процессинговой функция
-		p.stepCancelFunc()
+		c.stepCancelFunc()
 	}
-
 }
 
 // EndWaitInput завершает ожидание ввода. с этого момента считается,
 // что мы можем получить данные только как результат выполнения
-func (p *Processor) EndWaitInput() {
-	p.waitInput.Store(false)
+func (c *Coordinator) EndWaitInput() {
+	c.waitInput.Store(false)
 }
 
-// CleanUP очищает очереди всех потоков
-func (p *Processor) CleanUP(ctx context.Context) error {
-	for _, step := range p.reg {
+// CleanUP очищает очереди всех потоков.
+func (c *Coordinator) CleanUP(ctx context.Context) error {
+	for _, step := range c.reg {
 		err := step.Close(ctx, true)
 		if err != nil {
 			return err
@@ -160,23 +160,21 @@ func (p *Processor) CleanUP(ctx context.Context) error {
 	return nil
 }
 
-// RegSteps регистрирует этапы в процессоре.
-// Хранилище необходимо для централизованного управления всеми этапами
-func (p *Processor) RegSteps(steps ...StepInstance) error {
-	if p.closed.Load() {
-		return ErrProcessorClosed
+// RegSteps регистрирует этапы в координаторе.
+func (c *Coordinator) RegSteps(steps ...StepInstance) error {
+	if c.closed.Load() {
+		return ErrClosed
 	}
 
 	for i := range steps {
-		p.reg[steps[i].Name()] = steps[i]
+		c.reg[steps[i].Name()] = steps[i]
 	}
-
 	return nil
 }
 
 // watchQueues процесс отслеживания состояния очереди.
 // при отмене контекста или "паузе" (suspend) - прекращает работу
-func (p *Processor) watchQueues(ctx context.Context) {
+func (c *Coordinator) watchQueues(ctx context.Context) {
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 watchLoop:
@@ -184,21 +182,21 @@ watchLoop:
 		select {
 		case <-ctx.Done():
 			break watchLoop
-		case <-p.doneCh:
+		case <-c.doneCh:
 			break watchLoop
-		case <-p.suspendCh:
+		case <-c.suspendCh:
 			break watchLoop
 		case <-ticker.C:
 			exit := func() bool {
-				// если процессор ждет завершения ввода - продолжаем наблюдение
-				if p.waitInput.Load() {
+				// если координатор ждет завершения ввода - продолжаем наблюдение
+				if c.waitInput.Load() {
 					log.Debugf("waiting end of input")
 					return false
 				}
 
 				// если есть активные задачи - возвращаемся в цикл
-				if pc := p.counter.Count(); pc > 0 {
-					log.Debugf("processor pending %d messages", pc)
+				if pc := c.counter.Count(); pc > 0 {
+					log.Debugf("%s pending %d processes", c.name, pc)
 					return false
 				}
 				return true
@@ -210,6 +208,4 @@ watchLoop:
 			}
 		}
 	}
-
-	log.Debugf("watchQueues is done")
 }
