@@ -1,6 +1,6 @@
 // nolint
 
-package main
+package saga
 
 import (
 	"context"
@@ -59,6 +59,7 @@ func useRedisQueue[T any](name string) (step.Queue[T], error) {
 
 }
 
+// nolint: unused
 func main() {
 	err := Run()
 	if err != nil {
@@ -87,8 +88,8 @@ func Run() error {
 	pName := "cpt-active"
 
 	p1, err := coordinator.New(pName, gc, true)
+	defer cancel()
 	if err != nil {
-		cancel()
 		return fmt.Errorf("init orchestrator error")
 	}
 
@@ -101,7 +102,10 @@ func Run() error {
 	// SAVE To DB
 	stSave := &StepSaveResult[Host]{Name: "step-save"}
 	stSaveQ, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, stSave.Name))
-	stepSave, _ = step.NewStep[Host](stSave.Name, stSaveQ, 1, gc, nil, stSave.saveResults, nil)
+	err = stepSave.Init(stSave.Name, stSaveQ, 1, gc, nil, stSave.saveResults, nil)
+	if err != nil {
+		return err
+	}
 
 	// COMPENSATE
 	stComp := &StepComp[Host]{
@@ -110,7 +114,10 @@ func Run() error {
 		wasRetry: false,
 	}
 	stCompQ, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, stComp.Name))
-	stepComp, _ = step.NewStep[Host](stComp.Name, stCompQ, 1, gc, nil, stComp.stepF, nil)
+	err = stepComp.Init(stComp.Name, stCompQ, 1, gc, nil, stComp.stepF, nil)
+	if err != nil {
+		return err
+	}
 
 	// STEP 3
 	st3 := &Step3[Host]{
@@ -118,7 +125,10 @@ func Run() error {
 		saveDB: stepSave,
 	}
 	st3Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, st3.Name))
-	step3, _ = step.NewStep[Host](st3.Name, st3Q, 1, gc, nil, st3.stepF, nil)
+	err = step3.Init(st3.Name, st3Q, 1, gc, nil, st3.stepF, nil)
+	if err != nil {
+		return err
+	}
 
 	// STEP 2
 	st2 := &Step2[Host]{
@@ -126,15 +136,20 @@ func Run() error {
 		step3: step3,
 	}
 	st2Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, st2.Name))
-	step2, _ = step.NewStep[Host](st2.Name, st2Q, 1, gc, nil, st2.stepF, nil)
+	err = step2.Init(st2.Name, st2Q, 1, gc, nil, st2.stepF, nil)
+	if err != nil {
+		return err
+	}
 
 	st1 := &Step1{
 		Name:  "step-1",
 		step2: step2,
 	}
 	st1Q, _ := useRedisQueue[Host](fmt.Sprintf("%s-%s", pName, st1.Name))
-	step1, _ = step.NewStep[Host](st1.Name, st1Q, 1, gc, nil, st1.stepF, nil)
-
+	err = step1.Init(st1.Name, st1Q, 1, gc, nil, st1.stepF, nil)
+	if err != nil {
+		return err
+	}
 	rts := TaskController{
 		CancelFunc:  cancel,
 		SuspendFunc: p1.Suspend,
@@ -142,7 +157,7 @@ func Run() error {
 	}
 	_ = rts
 
-	err = step1.Publish(ctx, Host{
+	err = step1.Push(ctx, Host{
 		IP:      "127.0.0.1",
 		Domains: nil,
 	})
@@ -150,7 +165,7 @@ func Run() error {
 		log.WithError(err).Errorf("")
 	}
 
-	err = stepComp.Publish(ctx, Host{
+	err = stepComp.Push(ctx, Host{
 		IP:      "COMP",
 		Domains: nil,
 	})
@@ -184,13 +199,33 @@ func Run() error {
 			cancel()
 			log.Errorf("init orchestrator error")
 		}
-		stepSave_2, _ := step.NewStep[Host](stSave.Name, stSaveQ, 1, gc, nil, stSave.saveResults, nil)
-		stepComp_2, _ := step.NewStep[Host](stComp.Name, stCompQ, 1, gc, nil, stComp.stepF, nil)
-		step3_2, _ := step.NewStep[Host](st3.Name, st3Q, 1, gc, nil, st3.stepF, nil)
-		step2_2, _ := step.NewStep[Host](st2.Name, st2Q, 1, gc, nil, st2.stepF, nil)
-		step1_2, _ := step.NewStep[Host](st1.Name, st1Q, 1, gc, nil, st1.stepF, nil)
+		stepsave2 := &step.Step[Host]{}
+		err = stepsave2.Init(stSave.Name, stSaveQ, 1, gc, nil, stSave.saveResults, nil)
+		if err != nil {
+			log.WithError(err).Errorf("stepsave2")
+		}
+		stepcomp2 := &step.Step[Host]{}
+		err = stepcomp2.Init(stComp.Name, stCompQ, 1, gc, nil, stComp.stepF, nil)
+		if err != nil {
+			log.WithError(err).Errorf("stepcomp2")
+		}
+		step32 := &step.Step[Host]{}
+		err = step32.Init(st3.Name, st3Q, 1, gc, nil, st3.stepF, nil)
+		if err != nil {
+			log.WithError(err).Errorf("step32")
+		}
+		step22 := &step.Step[Host]{}
+		err = step22.Init(st2.Name, st2Q, 1, gc, nil, st2.stepF, nil)
+		if err != nil {
+			log.WithError(err).Errorf("step22")
+		}
+		step12 := &step.Step[Host]{}
+		err = step12.Init(st1.Name, st1Q, 1, gc, nil, st1.stepF, nil)
+		if err != nil {
+			log.WithError(err).Errorf("step12")
+		}
 
-		_ = p2.RegSteps(step1_2, step2_2, step3_2, stepSave_2, stepComp_2)
+		_ = p2.RegSteps(step12, step22, step32, stepsave2, stepcomp2)
 
 		err = p2.Run(ctx)
 		if err != nil {
@@ -241,7 +276,7 @@ func (s *Step1) stepF(ctx context.Context, fo Host) (bool, error) {
 	}
 
 	for i := range res {
-		_ = s.step2.Publish(ctx, res[i])
+		_ = s.step2.Push(ctx, res[i])
 	}
 
 	return true, nil
@@ -262,7 +297,7 @@ func (s *Step2[T]) stepF(ctx context.Context, fo Host) (bool, error) {
 	}
 
 	for i := range res {
-		_ = s.step3.Publish(ctx, res[i])
+		_ = s.step3.Push(ctx, res[i])
 	}
 
 	return true, nil
@@ -284,16 +319,14 @@ func (s *Step3[T]) stepF(ctx context.Context, fo Host) (bool, error) {
 	}
 
 	for i := range res {
-		_ = s.saveDB.Publish(ctx, res[i])
+		_ = s.saveDB.Push(ctx, res[i])
 	}
-	// res = append(res, Host{IP: "FO-COMP"})
 	return true, nil
 }
 
 type StepComp[T Host] struct {
 	Name     string
 	saveDB   *step.Step[Host]
-	step3    *step.Step[Host]
 	wasRetry bool
 }
 
@@ -303,7 +336,7 @@ func (s *StepComp[T]) stepF(ctx context.Context, fo Host) (bool, error) {
 		return false, nil
 	}
 
-	_ = s.saveDB.Publish(ctx, fo)
+	_ = s.saveDB.Push(ctx, fo)
 
 	return true, nil
 }

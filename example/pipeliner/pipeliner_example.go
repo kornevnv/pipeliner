@@ -1,6 +1,6 @@
 // nolint
 
-package main
+package pipeliner
 
 import (
 	"context"
@@ -32,10 +32,6 @@ type Host struct {
 }
 
 var r = new(res)
-
-type RTS struct {
-	tasks map[int64]TaskController
-}
 
 type TaskController struct {
 	CancelFunc  context.CancelFunc
@@ -119,6 +115,7 @@ func initPipeliner(ctx context.Context) (*pl.Pipeliner[Host], error) {
 	return proc, nil
 }
 
+// nolint: unused
 func main() {
 	err := Run()
 	if err != nil {
