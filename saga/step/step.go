@@ -108,8 +108,8 @@ func (s *Step[T]) Init(
 	return nil
 }
 
-// Put публикует событие с соответствующим типом в очередь этапа
-func (s *Step[T]) Put(_ context.Context, val T) error {
+// Push публикует событие с соответствующим типом в очередь этапа
+func (s *Step[T]) Push(_ context.Context, val T) error {
 	if !s.initialized.Load() {
 		return errStepIsNotInitialized
 	}
@@ -205,6 +205,10 @@ func (s *Step[T]) do(ctx context.Context) {
 		if s.filterFunc != nil {
 			fVal, err := s.filterFunc(ctx, val)
 			s.errHandling(ctx, err)
+			// не прошло фильтрацию
+			if fVal == nil {
+				continue
+			}
 			val = *fVal
 		}
 
@@ -213,7 +217,7 @@ func (s *Step[T]) do(ctx context.Context) {
 
 		// производим ретрай, при необходимости
 		if !ok {
-			err := s.Put(ctx, val)
+			err := s.Push(ctx, val)
 			s.errHandling(ctx, err)
 		}
 		s.pendingOpsCounter.Dec()
