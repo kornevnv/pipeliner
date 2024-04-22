@@ -207,6 +207,7 @@ func (s *Step[T]) do(ctx context.Context) {
 			s.errHandling(ctx, err)
 			// не прошло фильтрацию
 			if fVal == nil {
+				s.pendingOpsCounter.Dec()
 				continue
 			}
 			val = *fVal
