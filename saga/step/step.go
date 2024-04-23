@@ -110,11 +110,15 @@ func (s *Step[T]) Init(
 
 // Push публикует событие с соответствующим типом в очередь этапа
 func (s *Step[T]) Push(_ context.Context, val T) error {
+	s.pendingOpsCounter.Inc()
+	defer func() {
+		s.pendingOpsCounter.Dec()
+	}()
+
 	if !s.initialized.Load() {
 		return errStepIsNotInitialized
 	}
-	s.pendingOpsCounter.Inc()
-	defer s.pendingOpsCounter.Dec()
+
 	if s.closed.Load() {
 		return errStepIsClosed
 	}
@@ -138,7 +142,7 @@ func (s *Step[T]) Close(_ context.Context, clear bool) error {
 	return nil
 }
 
-// readQueue читает очередь и отправляет данные в канал
+// readQueue слушает сигналы (очередь, отмена, пауза)
 func (s *Step[T]) readQueue(ctx context.Context, doneCh, suspendCh chan struct{}) {
 	defer close(s.inChan)
 watchLoop:
@@ -151,19 +155,28 @@ watchLoop:
 		case <-suspendCh:
 			break watchLoop
 		case <-s.queue.Signal():
-			s.pendingOpsCounter.Inc()
-			next, ok, err := s.queue.Next()
-			s.pendingOpsCounter.Dec()
-			if !ok {
-				continue watchLoop
-			}
-			if err != nil {
-				s.errHandling(ctx, fmt.Errorf("step %s get next val error: %s", s.name, err))
-				continue watchLoop
-			}
-			s.inChan <- next
+			s.processQueue(ctx)
 		}
 	}
+}
+
+// processQueue получает элемент очереди и отправляет в рабочий канал
+func (s *Step[T]) processQueue(ctx context.Context) {
+	s.pendingOpsCounter.Inc()
+	defer func() {
+		s.pendingOpsCounter.Dec()
+	}()
+
+	next, ok, err := s.queue.Next()
+
+	if !ok {
+		return
+	}
+	if err != nil {
+		s.errHandling(ctx, fmt.Errorf("step %s get next val error: %s", s.name, err))
+		return
+	}
+	s.inChan <- next
 }
 
 // Run инициализирует пул воркеров и запускает на них обработку потока данных
@@ -197,31 +210,37 @@ func (s *Step[T]) Run(ctx context.Context, doneCh, suspendCh chan struct{}) erro
 // Получает данные из входного канала, выполняет процессинг и отправляет данные в следующие потоки
 func (s *Step[T]) do(ctx context.Context) {
 	for val := range s.inChan {
-		// увеличиваем счетчик ожидания и последовательно выполняем процессинговые функции
-		// отправляем ошибки в функцию обработки, если она определена
-		s.pendingOpsCounter.Inc()
+		s.processVal(ctx, val)
+	}
+}
 
-		// выполняем функции обработки (фильтрация -> процессинг -> обработка ошибок -> [ретрай]
-		if s.filterFunc != nil {
-			fVal, err := s.filterFunc(ctx, val)
-			s.errHandling(ctx, err)
-			// не прошло фильтрацию
-			if fVal == nil {
-				s.pendingOpsCounter.Dec()
-				continue
-			}
-			val = *fVal
-		}
-
-		ok, err := s.procFunc(ctx, val)
-		s.errHandling(ctx, err)
-
-		// производим ретрай, при необходимости
-		if !ok {
-			err := s.Push(ctx, val)
-			s.errHandling(ctx, err)
-		}
+// processVal производит обработку значения (фильрации, процессинг)
+func (s *Step[T]) processVal(ctx context.Context, val T) {
+	// увеличиваем счетчик ожидания и последовательно выполняем процессинговые функции
+	s.pendingOpsCounter.Inc()
+	defer func() {
 		s.pendingOpsCounter.Dec()
+	}()
+
+	// выполняем функции обработки (фильтрация -> процессинг -> обработка ошибок -> [ретрай]
+	if s.filterFunc != nil {
+		fVal, err := s.filterFunc(ctx, val)
+		// отправляем ошибки в функцию обработки, если она определена
+		s.errHandling(ctx, err)
+		// не прошло фильтрацию
+		if fVal == nil {
+			return
+		}
+		val = *fVal
+	}
+
+	ok, err := s.procFunc(ctx, val)
+	s.errHandling(ctx, err)
+
+	// производим ретрай, при необходимости
+	if !ok {
+		err := s.Push(ctx, val)
+		s.errHandling(ctx, err)
 	}
 }
 
