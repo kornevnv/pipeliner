@@ -253,7 +253,7 @@ func Run() error {
 	// rts.CleanUPFunc()
 
 	if len(a) != 10001 {
-		return fmt.Errorf("struct must contains 10003 items")
+		return fmt.Errorf("struct must contains 10001 items")
 	}
 
 	return nil

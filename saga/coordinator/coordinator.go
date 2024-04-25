@@ -135,8 +135,10 @@ func (c *Coordinator) Run(ctx context.Context) error {
 // флаг force указывает на необходимость отмены контекста дочерних процессов,
 // не дожидается завершения обработки уже отправленных в processFunc данных.
 func (c *Coordinator) Suspend(force bool) {
-	close(c.suspendCh)
-
+	if !c.closed.Load() {
+		close(c.suspendCh)
+	}
+	c.closed.Store(true)
 	if force {
 		// отменяем контекст потоков, чтобы донести отмену процессинговой функция
 		c.stepCancelFunc()
