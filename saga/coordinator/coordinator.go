@@ -136,9 +136,10 @@ func (c *Coordinator) Run(ctx context.Context) error {
 // не дожидается завершения обработки уже отправленных в processFunc данных.
 func (c *Coordinator) Suspend(force bool) {
 	if !c.closed.Load() {
+		c.closed.Store(true)
 		close(c.suspendCh)
 	}
-	c.closed.Store(true)
+
 	if force {
 		// отменяем контекст потоков, чтобы донести отмену процессинговой функция
 		c.stepCancelFunc()
