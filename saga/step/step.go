@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -14,6 +15,8 @@ var (
 	errStepIsNotInitialized = errors.New("step is not initialized, use *step.Init(...)")
 
 	defaultWorkerCount = 1
+
+	checkInterval = time.Second
 )
 
 // Queue определяет интерфейс очереди
@@ -137,6 +140,10 @@ func (s *Step[T]) Close(_ context.Context, clear bool) error {
 	}
 	s.closed.Store(true)
 	if clear {
+		// дожидаемся завершения всех запущенных операций
+		for s.pendingOpsCounter.Count() > 0 {
+			time.Sleep(checkInterval)
+		}
 		return s.queue.Clear()
 	}
 	return nil
