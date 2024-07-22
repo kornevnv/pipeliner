@@ -14,13 +14,14 @@ var (
 	errPipeNameIsNotSet       = errors.New("pipe name is not set")
 	errPipeProcFuncIsNotSet   = errors.New("pipe processing functions is not set")
 	errPipeAlreadyInitialized = errors.New("pipe queue is already initialized")
+	errPipeIsClosed           = errors.New("pipe is already closed")
 
 	defaultWorkerCount = 1
 )
 
-// processFunc процессинговая функция. Возвращает массив обработанных результатов,
+// ProcessFunc процессинговая функция. Возвращает массив обработанных результатов,
 // массив результатов компенсации (тех объектов, которые не были обработаны) и ошибку
-type processFunc[T any] func(ctx context.Context, input ...T) (results []T, compensate []T, err error)
+type ProcessFunc[T any] func(ctx context.Context, input ...T) (results []T, retry []T, err error)
 
 // errFunc функция обработки ошибок
 type errFunc func(context.Context, error)
@@ -37,7 +38,7 @@ type pipe[T any] struct {
 	queue Queue[T]
 
 	// функции обработки данных
-	procFs []processFunc[T]
+	procFs []ProcessFunc[T]
 
 	// функции обработки ошибки
 	errF errFunc
@@ -51,8 +52,8 @@ type pipe[T any] struct {
 	// кол-во процессов, в текущий момент времени
 	pendingCount atomic.Int64
 
-	// флаг открытия потока. При отправке данных в поток - устанавливается в True
-	opened atomic.Bool
+	// флаг статуса потока
+	closed atomic.Bool
 
 	// флаг инициализации
 	initialized atomic.Bool
@@ -67,27 +68,37 @@ type pipeOut[T any] struct {
 	data   T
 }
 
-// newPipe инициализирует экземпляр потока данных
-func newPipe[T any](pipelinerName, pipeName string, q Queue[T], outF []string, wCount int, pFunc ...processFunc[T]) (*pipe[T], error) {
-	if len(pFunc) == 0 {
+type PipeParams[T any] struct {
+	Name         string
+	WorkerCount  int
+	ProcessFuncs []ProcessFunc[T]
+	OutPipes     []string
+}
+
+// newPipe инициализирует экземпляр потока данных.
+// обработка происходит по всем указанным processFunc ПОСЛЕДОВАТЕЛЬНО!
+// т.е. pf1 -> pf2 -> pf3, и только после выполнения всех - результат уходит в outF.
+// retry обрабатывается из всех processFunc
+func newPipe[T any](pipelinerName string, q Queue[T], params PipeParams[T]) (*pipe[T], error) {
+	if len(params.ProcessFuncs) == 0 {
 		return nil, errPipeProcFuncIsNotSet
 	}
-	if pipeName == "" {
+	if params.Name == "" {
 		return nil, errPipeNameIsNotSet
 	}
 
-	if wCount == 0 {
-		wCount = defaultWorkerCount
+	if params.WorkerCount == 0 {
+		params.WorkerCount = defaultWorkerCount
 	}
 
-	id := fmt.Sprintf("%s-%s", pipelinerName, pipeName)
+	id := fmt.Sprintf("%s-%s", pipelinerName, params.Name)
 
 	return &pipe[T]{
 		id:          id,
-		name:        pipeName,
-		outPipes:    outF,
-		procFs:      pFunc,
-		workerCount: wCount,
+		name:        params.Name,
+		outPipes:    params.OutPipes,
+		procFs:      params.ProcessFuncs,
+		workerCount: params.WorkerCount,
 		changedSig:  make(chan struct{}, 1),
 		inCh:        make(chan T, 1),
 		outCh:       make(chan pipeOut[T]),
@@ -100,18 +111,30 @@ func (p *pipe[T]) incPending() {
 	p.pendingCount.Add(1)
 }
 
-func (p *pipe[T]) push(ctx context.Context, val T) error {
-	return p.queue.Push(val)
-}
-
 // decPending уменьшает счетчик на 1
 func (p *pipe[T]) decPending() {
 	p.pendingCount.Add(-1)
 }
 
+func (p *pipe[T]) push(ctx context.Context, val ...T) error {
+	p.incPending()
+	defer p.decPending()
+	if p.closed.Load() {
+		return errPipeIsClosed
+	}
+	for _, v := range val {
+		err := p.queue.Push(v)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // run инициализирует пул воркеров и запускает на них обработку потока данных
 func (p *pipe[T]) run(ctx context.Context, doneCh, suspendCh chan struct{}) error {
 	defer close(p.outCh)
+
 	// проверка и установка флага инициализации
 	if p.initialized.Load() {
 		return errPipeAlreadyInitialized
@@ -158,13 +181,15 @@ watchLoop:
 			log.Debugf("stage %s context is done by suspend", p.id)
 			break watchLoop
 		case <-p.queue.Signal():
+			p.incPending()
 			next, ok, err := p.queue.Next()
+			p.decPending()
 			if !ok {
-				break watchLoop
+				continue watchLoop
 			}
 			if err != nil {
 				log.Errorf("stage %s get next val error: %s", p.id, err)
-				continue
+				continue watchLoop
 			}
 			p.inCh <- next
 		}
@@ -179,29 +204,17 @@ func (p *pipe[T]) do(ctx context.Context) {
 		// увеличиваем счетчик ожидания и последовательно выполняем процессинговые функции
 		// отправляем ошибки в функцию обработки, если она определена
 		p.incPending()
-		for i, pf := range p.procFs {
-			results, compensate, err := pf(ctx, val)
-			if err != nil {
-				if p.errF != nil {
-					p.errF(ctx, err)
-				}
-				log.Debugf("pipe %s was detected error at %d processing function result", p.name, i)
-			}
-			for _, cmp := range compensate {
-				p.outCh <- pipeOut[T]{
-					target: p.name,
-					data:   cmp,
-				}
-				log.Debugf("pipe %s was detected retry obj: %v at %d processing function result", p.name, cmp, i)
-			}
 
-			// отправляем результат в указанные в outPipes потоки
-			for _, result := range results {
-				for _, target := range p.outPipes {
-					p.outCh <- pipeOut[T]{
-						target: target,
-						data:   result,
-					}
+		// retry не обрабатываем, т.к. он уже обработан в runProcFunc
+		results, _, err := p.runProcFunc(ctx, 0, val)
+		if p.errF != nil {
+			p.errF(ctx, err)
+		}
+		for _, result := range results {
+			for _, target := range p.outPipes {
+				p.outCh <- pipeOut[T]{
+					target: target,
+					data:   result,
 				}
 			}
 		}
@@ -209,7 +222,34 @@ func (p *pipe[T]) do(ctx context.Context) {
 	}
 }
 
+func (p *pipe[T]) runProcFunc(ctx context.Context, pfIdx int, val ...T) ([]T, []T, error) {
+	result, retry, err := p.procFs[pfIdx](ctx, val...)
+	if err != nil {
+		if p.errF != nil {
+			p.errF(ctx, err)
+		}
+		log.Debugf("pipe %s was detected error at %d processing function result", p.name, pfIdx)
+	}
+	for _, r := range retry {
+		p.outCh <- pipeOut[T]{
+			target: p.name,
+			data:   r,
+		}
+		log.Debugf("pipe %s was detected retry objs count: %v at %d processing function result", p.name, r, pfIdx)
+	}
+
+	// если это не последня функция - замыкаем
+	if pfIdx < len(p.procFs)-1 {
+		return p.runProcFunc(ctx, pfIdx+1, result...)
+	}
+
+	// отправляем результат в указанные в outPipes потоки
+	return result, nil, nil
+
+}
+
 func (p *pipe[T]) closeQueue(clear bool) error {
+	p.closed.Store(true)
 	if clear {
 		return p.queue.Clear()
 	}

@@ -5,34 +5,45 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"fmt"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-redis/redis/v7"
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	retryDelay = 3 * time.Second
+)
+
 type Queue[T any] struct {
-	client *redis.Client
-	name   string
-	signal chan struct{}
+	client  *redis.Client
+	name    string
+	signal  chan struct{}
+	len     atomic.Int64
+	options *redis.Options
 }
 
-func New[T any](addr, password string, db int, name string) (*Queue[T], error) {
-	c := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-	})
+func New[T any](name string, options *redis.Options) (*Queue[T], error) {
+	c := redis.NewClient(options)
 
 	err := c.Ping().Err()
 	if err != nil {
 		return nil, err
 	}
 
-	return &Queue[T]{
-		client: c,
-		name:   name,
-		signal: make(chan struct{}, 1),
-	}, nil
+	q := &Queue[T]{
+		client:  c,
+		name:    name,
+		signal:  make(chan struct{}, 1),
+		options: options,
+	}
+	q.len.Store(q.client.LLen(q.name).Val())
+	return q, nil
+}
+
+func (q *Queue[T]) reconnect() {
+	q.client = redis.NewClient(q.options)
 }
 
 func (q *Queue[T]) Clear() error {
@@ -40,22 +51,35 @@ func (q *Queue[T]) Clear() error {
 }
 
 func (q *Queue[T]) Len() int {
-	l := q.client.LLen(q.name)
+	ilen := q.len.Load()
+	if ilen == 0 {
+		qlen := q.client.LLen(q.name)
+		if qlen == nil || qlen.Err() != nil {
+			log.WithField("queue", q.name).Errorf("queue: %v get len error", q.name)
+			time.Sleep(retryDelay)
+			q.reconnect()
+			return q.Len()
+		}
+		return int(qlen.Val())
+	}
 
-	return int(l.Val())
+	return int(ilen)
 }
 
 func (q *Queue[T]) Push(element T) error {
 	encodedVal, err := encode(element)
 	if err != nil {
 		log.WithField("queue", q.name).Errorf("encode val: %v error: %s", element, err)
-		return fmt.Errorf("encode val error: %s", err)
+		time.Sleep(retryDelay)
+		q.reconnect()
+		return q.Push(element)
 	}
 	_, err = q.client.LPush(q.name, encodedVal).Result()
 	if err != nil {
 		log.WithField("queue", q.name).Errorf("push val: %v error: %s", element, err)
 		return err
 	}
+	q.len.Add(1)
 
 	select {
 	case q.signal <- struct{}{}:
@@ -74,8 +98,10 @@ func (q *Queue[T]) Next() (T, bool, error) {
 
 	val, err := q.client.RPop(q.name).Result()
 	if err != nil {
-		log.WithField("queue", q.name).Errorf("empry pop val form queue: %s", q.name)
-		return item, false, fmt.Errorf("get val error: %s", err)
+		log.WithField("queue", q.name).Errorf("pop val form queue: %s error: %s", q.name, err)
+		time.Sleep(retryDelay)
+		q.reconnect()
+		return q.Next()
 	}
 
 	err = decode(val, &item)
@@ -83,6 +109,7 @@ func (q *Queue[T]) Next() (T, bool, error) {
 		log.WithField("queue", q.name).Errorf("decode val: %v error: %s", val, err)
 		return item, false, fmt.Errorf("encode val error: %s", err)
 	}
+	q.len.Add(-1)
 
 	return item, true, nil
 }

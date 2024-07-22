@@ -1,4 +1,4 @@
-module pipeliner
+module sdg-gitlab.solar.local/golang/pipeliner.git
 
 go 1.21
 
